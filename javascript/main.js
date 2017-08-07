@@ -11,9 +11,12 @@ var ACC_NONE=0;
 var ACC_ACCELERATE=1;
 var ACC_BRAKE=2;
 
-var WIDTH_PX=600;   //screen width in pixels
-var HEIGHT_PX=400; //screen height in pixels
-var SCALE=15;      //how many pixels in a meter
+var DRIFT_NONE=0;
+var DRIFT_ON=1;
+
+var WIDTH_PX=1280;   //screen width in pixels
+var HEIGHT_PX=720; //screen height in pixels
+var SCALE=8;      //how many pixels in a meter
 var WIDTH_M=WIDTH_PX/SCALE; //world width in meters. for this example, world is as large as the screen
 var HEIGHT_M=HEIGHT_PX/SCALE; //world height in meters
 var KEYS_DOWN={}; //keep track of what keys are held down by the player
@@ -23,44 +26,45 @@ var b2world;
 var font=new gamejs.font.Font('16px Sans-serif');
 
 //key bindings
-var BINDINGS={accelerate:gamejs.event.K_UP, 
-              brake:gamejs.event.K_DOWN,      
-              steer_left:gamejs.event.K_LEFT, 
-               steer_right:gamejs.event.K_RIGHT}; 
+var BINDINGS={accelerate:gamejs.event.K_UP,
+              brake:gamejs.event.K_DOWN,
+              steer_left:gamejs.event.K_LEFT,
+               steer_right:gamejs.event.K_RIGHT,
+              drift:gamejs.event.K_SPACE};
 
 
 var BoxProp = function(pars){
     /*
    static rectangle shaped prop
-     
+
      pars:
      size - array [width, height]
      position - array [x, y], in world meters, of center
     */
     this.size=pars.size;
-    
+
     //initialize body
     var bdef=new box2d.b2BodyDef();
     bdef.position=new box2d.b2Vec2(pars.position[0], pars.position[1]);
     bdef.angle=0;
     bdef.fixedRotation=true;
     this.body=b2world.CreateBody(bdef);
-    
+
     //initialize shape
     var fixdef=new box2d.b2FixtureDef;
     fixdef.shape=new box2d.b2PolygonShape();
     fixdef.shape.SetAsBox(this.size[0]/2, this.size[1]/2);
     fixdef.restitution=0.4; //positively bouncy!
     this.body.CreateFixture(fixdef);
-    return this;  
+    return this;
 };
 
 function Wheel(pars){
     /*
-    wheel object 
-          
+    wheel object
+
     pars:
-    
+
     car - car this wheel belongs to
     x - horizontal position in meters relative to car's center
     y - vertical position in meters relative to car's center
@@ -81,7 +85,7 @@ function Wheel(pars){
     def.position=this.car.body.GetWorldPoint(new box2d.b2Vec2(this.position[0], this.position[1]));
     def.angle=this.car.body.GetAngle();
     this.body=b2world.CreateBody(def);
-    
+
     //initialize shape
     var fixdef= new box2d.b2FixtureDef;
     fixdef.density=1;
@@ -148,11 +152,34 @@ Wheel.prototype.killSidewaysVelocity=function(){
 
 };
 
+Wheel.prototype.getStifleVelocityVector=function(){
+    /*
+    substracts sideways velocity from this wheel's velocity vector and returns the remaining front-facing velocity vector
+    */
+    var velocity=this.body.GetLinearVelocity();
+    var sideways_axis=this.getDirectionVector();
+    var dotprod=vectors.dot([velocity.x, velocity.y], sideways_axis);
+
+    if ((velocity.x * velocity.x) + (velocity.y * velocity.y) > 10){
+        return [(velocity.x * 2 + sideways_axis[0] * dotprod) / 3, (velocity.y * 2 + sideways_axis[1] * dotprod) / 3]
+    }else{
+        return [sideways_axis[0]*dotprod, sideways_axis[1]*dotprod]
+    }
+};
+
+Wheel.prototype.stifleSidewaysVelocity=function(){
+    /*
+    removes some sideways velocity from this wheels velocity
+    */
+    var kv=this.getStifleVelocityVector();
+    this.body.SetLinearVelocity(new box2d.b2Vec2(kv[0], kv[1]));
+};
+
 
 function Car(pars){
     /*
     pars is an object with possible attributes:
-    
+
     width - width of the car in meters
     length - length of the car in meters
     position - starting position of the car, array [x, y] in meters
@@ -170,23 +197,24 @@ function Car(pars){
     //state of car controls
     this.steer=STEER_NONE;
     this.accelerate=ACC_NONE;
-    
+    this.drift=DRIFT_NONE;
+
     this.max_steer_angle=pars.max_steer_angle;
     this.max_speed=pars.max_speed;
     this.power=pars.power;
     this.wheel_angle=0;//keep track of current wheel angle relative to car.
                        //when steering left/right, angle will be decreased/increased gradually over 200ms to prevent jerkyness.
-    
+
     //initialize body
     var def=new box2d.b2BodyDef();
     def.type = box2d.b2Body.b2_dynamicBody;
     def.position=new box2d.b2Vec2(pars.position[0], pars.position[1]);
-    def.angle=math.radians(pars.angle); 
-    def.linearDamping=0.15;  //gradually reduces velocity, makes the car reduce speed slowly if neither accelerator nor brake is pressed
+    def.angle=math.radians(pars.angle);
+    def.linearDamping=0.80;  //gradually reduces velocity, makes the car reduce speed slowly if neither accelerator nor brake is pressed
     def.bullet=true; //dedicates more time to collision detection - car travelling at high speeds at low framerates otherwise might teleport through obstacles.
     def.angularDamping=0.3;
     this.body=b2world.CreateBody(def);
-    
+
     //initialize shape
     var fixdef= new box2d.b2FixtureDef();
     fixdef.density = 1.0;
@@ -195,7 +223,7 @@ function Car(pars){
     fixdef.shape=new box2d.b2PolygonShape;
     fixdef.shape.SetAsBox(pars.width/2, pars.length/2);
     this.body.CreateFixture(fixdef);
-    
+
     //initialize wheels
     this.wheels=[]
     var wheeldef, i;
@@ -255,37 +283,51 @@ Car.prototype.setSpeed=function(speed){
 };
 
 Car.prototype.update=function(msDuration){
-    
+
         //1. KILL SIDEWAYS VELOCITY
-        
+
         //kill sideways velocity for all wheels
         var i;
-        for(i=0;i<this.wheels.length;i++){
-            this.wheels[i].killSidewaysVelocity();
+        var wheels=this.wheels;
+        for(i=0;i<wheels.length;i++){
+            if(this.drift==DRIFT_ON && this.accelerate==ACC_ACCELERATE){
+                wheels[i].stifleSidewaysVelocity();
+            }else{
+				wheels[i].killSidewaysVelocity();
+			}
         }
-    
+
+
         //2. SET WHEEL ANGLE
-  
+
         //calculate the change in wheel's angle for this update, assuming the wheel will reach is maximum angle from zero in 200 ms
         var incr=(this.max_steer_angle/200) * msDuration;
-        
+
         if(this.steer==STEER_RIGHT){
-            this.wheel_angle=Math.min(Math.max(this.wheel_angle, 0)+incr, this.max_steer_angle) //increment angle without going over max steer
+            if(this.drift==DRIFT_ON && this.accelerate==ACC_ACCELERATE){
+                this.wheel_angle=Math.min(Math.max(this.wheel_angle, 0)+incr, this.max_steer_angle + 20) //increment angle without going over max steer
+            }else{
+				this.wheel_angle=Math.min(Math.max(this.wheel_angle, 0)+incr, this.max_steer_angle) //increment angle without going over max steer
+			}
         }else if(this.steer==STEER_LEFT){
-            this.wheel_angle=Math.max(Math.min(this.wheel_angle, 0)-incr, -this.max_steer_angle) //decrement angle without going over max steer
+            if(this.drift==DRIFT_ON && this.accelerate==ACC_ACCELERATE){
+                this.wheel_angle=Math.min(Math.max(this.wheel_angle, 0)-incr, -this.max_steer_angle - 20) //increment angle without going over max steer
+            }else{
+				this.wheel_angle=Math.min(Math.max(this.wheel_angle, 0)-incr, -this.max_steer_angle) //increment angle without going over max steer
+            }
         }else{
-            this.wheel_angle=0;        
+            this.wheel_angle=0;
         }
 
         //update revolving wheels
-        var wheels=this.getRevolvingWheels();
+        wheels=this.getRevolvingWheels();
         for(i=0;i<wheels.length;i++){
             wheels[i].setAngle(this.wheel_angle);
         }
-        
+
         //3. APPLY FORCE TO WHEELS
         var base_vect; //vector pointing in the direction force will be applied to a wheel ; relative to the wheel.
-        
+
         //if accelerator is pressed down and speed limit has not been reached, go forwards
         if((this.accelerate==ACC_ACCELERATE) && (this.getSpeedKMH() < this.max_speed)){
             base_vect=[0, -1];
@@ -307,7 +349,7 @@ Car.prototype.update=function(msDuration){
            var position=wheels[i].body.GetWorldCenter();
            wheels[i].body.ApplyForce(wheels[i].body.GetWorldVector(new box2d.b2Vec2(fvect[0], fvect[1])), position );
         }
-        
+
         //if going very slow, stop - to prevent endless sliding
         if( (this.getSpeedKMH()<4) &&(this.accelerate==ACC_NONE)){
             this.setSpeed(0);
@@ -315,17 +357,38 @@ Car.prototype.update=function(msDuration){
 
 };
 
+function passenger(pars) {
+    var def=new box2d.b2BodyDef();
+    def.type = box2d.b2Body.b2_dynamicBody;
+    def.position=new box2d.b2Vec2(pars.position[0], pars.position[1]);
+    def.angle=math.radians(pars.angle);
+    def.linearDamping=0.80;  //gradually reduces velocity, makes the car reduce speed slowly if neither accelerator nor brake is pressed
+    def.bullet=true; //dedicates more time to collision detection - car travelling at high speeds at low framerates otherwise might teleport through obstacles.
+    def.angularDamping=0.3;
+    this.body=b2world.CreateBody(def);
+
+    //initialize shape
+    var fixdef= new box2d.b2FixtureDef();
+    fixdef.density = 1.0;
+    fixdef.friction = 0.3; //friction when rubbing agaisnt other shapes
+    fixdef.restitution = 0.4;  //amount of force feedback when hitting something. >0 makes the car bounce off, it's fun!
+    fixdef.shape=new box2d.b2PolygonShape;
+    fixdef.shape.SetAsBox(pars.width/2, pars.length/2);
+    this.body.CreateFixture(fixdef);
+
+}
+
 /*
  *initialize car and props, start game loop
  */
 function main(){
-   
+
     //initialize display
     var display = gamejs.display.setMode([WIDTH_PX, HEIGHT_PX]);
-    
+
     //SET UP B2WORLD
     b2world=new box2d.b2World(new box2d.b2Vec2(0, 0), false);
-    
+
     //set up box2d debug draw to draw the bodies for us.
     //in a real game, car will propably be drawn as a sprite rotated by the car's angle
     var debugDraw = new box2d.b2DebugDraw();
@@ -335,38 +398,71 @@ function main(){
     debugDraw.SetLineThickness(1.0);
     debugDraw.SetFlags(box2d.b2DebugDraw.e_shapeBit);
     b2world.SetDebugDraw(debugDraw);
-    
+
     //initialize car
     var car=new Car({'width':2,
                     'length':4,
                     'position':[10, 10],
-                    'angle':180, 
+                    'angle':180,
                     'power':60,
                     'max_steer_angle':20,
                     'max_speed':60,
-                    'wheels':[{'x':-1, 'y':-1.2, 'width':0.4, 'length':0.8, 'revolving':true, 'powered':true}, //top left
-                                {'x':1, 'y':-1.2, 'width':0.4, 'length':0.8, 'revolving':true, 'powered':true}, //top right
-                                {'x':-1, 'y':1.2, 'width':0.4, 'length':0.8, 'revolving':false, 'powered':false}, //back left
-                                {'x':1, 'y':1.2, 'width':0.4, 'length':0.8, 'revolving':false, 'powered':false}]}); //back right
-    
+                    'wheels':[{'x':-1, 'y':-1.2, 'width':0.4, 'length':0.8, 'revolving':true, 'powered':false}, //top left
+                                {'x':1, 'y':-1.2, 'width':0.4, 'length':0.8, 'revolving':true, 'powered':false}, //top right
+                                {'x':-1, 'y':1.2, 'width':0.4, 'length':0.8, 'revolving':false, 'powered':true}, //back left
+                                {'x':1, 'y':1.2, 'width':0.4, 'length':0.8, 'revolving':false, 'powered':true}]}); //back right
+
     //initialize some props to bounce against
     var props=[];
-    
+
     //outer walls
     props.push(new BoxProp({'size':[WIDTH_M, 1],    'position':[WIDTH_M/2, 0.5]}));
     props.push(new BoxProp({'size':[1, HEIGHT_M-2], 'position':[0.5, HEIGHT_M/2]}));
     props.push(new BoxProp({'size':[WIDTH_M, 1],    'position':[WIDTH_M/2, HEIGHT_M-0.5]}));
     props.push(new BoxProp({'size':[1, HEIGHT_M-2], 'position':[WIDTH_M-0.5, HEIGHT_M/2]}));
-    
+
     //pen in the center
     var center=[WIDTH_M/2, HEIGHT_M/2];
-    props.push(new BoxProp({'size':[1, 6], 'position':[center[0]-3, center[1]]}));
-    props.push(new BoxProp({'size':[1, 6], 'position':[center[0]+3, center[1]]}));
-    props.push(new BoxProp({'size':[5, 1], 'position':[center[0], center[1]+2.5]}));
-    
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-60, center[1]]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+60, center[1]]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-40, center[1]]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+40, center[1]]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-20, center[1]]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+20, center[1]]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0], center[1]]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-60, center[1]+20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+60, center[1]+20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-40, center[1]+20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+40, center[1]+20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-20, center[1]+20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+20, center[1]+20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0], center[1]+20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-60, center[1]-20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+60, center[1]-20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-40, center[1]-20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+40, center[1]-20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-20, center[1]-20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+20, center[1]-20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0], center[1]-20]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-60, center[1]+40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+60, center[1]+40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-40, center[1]+40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+40, center[1]+40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-20, center[1]+40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+20, center[1]+40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0], center[1]+40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-60, center[1]-40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+60, center[1]-40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-40, center[1]-40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+40, center[1]-40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]-20, center[1]-40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0]+20, center[1]-40]}));
+    props.push(new BoxProp({'size':[10, 10], 'position':[center[0], center[1]-40]}));
+
+
     function tick(msDuration) {
         //GAME LOOP
-        
+
         //set car controls according to player input
         if(KEYS_DOWN[BINDINGS.accelerate]){
             car.accelerate=ACC_ACCELERATE;
@@ -375,7 +471,7 @@ function main(){
         }else{
             car.accelerate=ACC_NONE;
         }
-        
+
         if(KEYS_DOWN[BINDINGS.steer_right]){
             car.steer=STEER_RIGHT;
         }else if(KEYS_DOWN[BINDINGS.steer_left]){
@@ -383,22 +479,28 @@ function main(){
         }else{
             car.steer=STEER_NONE;
         }
-        
+
+        if(KEYS_DOWN[BINDINGS.drift]){
+            car.drift=DRIFT_ON;
+        }else{
+            car.drift=DRIFT_NONE;
+        }
+
         //update car
         car.update(msDuration);
-        
+
         //update physics world
-        b2world.Step(msDuration/1000, 10, 8);        
-        
+        b2world.Step(msDuration/1000, 10, 8);
+
         //clear applied forces, so they don't stack from each update
         b2world.ClearForces();
-        
+
         //fill background
         gamejs.draw.rect(display, '#FFFFFF', new gamejs.Rect([0, 0], [WIDTH_PX, HEIGHT_PX]),0)
-        
+
         //let box2d draw it's bodies
         b2world.DrawDebugData();
-        
+
         //fps and car speed display
         display.blit(font.render('FPS: '+parseInt((1000)/msDuration)), [25, 25]);
         display.blit(font.render('SPEED: '+parseInt(Math.ceil(car.getSpeedKMH()))+' km/h'), [25, 55]);
@@ -407,11 +509,11 @@ function main(){
     function handleEvent(event){
         if (event.type === gamejs.event.KEY_DOWN) KEYS_DOWN[event.key] = true;
             //key release
-        else if (event.type === gamejs.event.KEY_UP) KEYS_DOWN[event.key] = false;  
+        else if (event.type === gamejs.event.KEY_UP) KEYS_DOWN[event.key] = false;
     };
     gamejs.onTick(tick, this);
     gamejs.onEvent(handleEvent);
-    
+
 }
 
 gamejs.ready(main);
